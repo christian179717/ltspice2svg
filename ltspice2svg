@@ -1,0 +1,1217 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from lxml import etree
+
+SVG_NS = "http://www.w3.org/2000/svg"
+
+# Conversion factors → mm
+_TO_MM = {
+    "mm": 1.0,
+    "cm": 10.0,
+    "in": 25.4,
+    "px": 1.0 / 3.7795275591,
+}
+
+# Conversion factor mm → px
+_MM_TO_PX = 3.7795275591
+
+
+def _parse_length(value: str):
+    """Return (numeric_mm, numeric_px) for an SVG length string."""
+    m = re.fullmatch(r"([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)\s*(mm|cm|in|px)", value.strip())
+    if m is None:
+        raise ValueError(f"Unsupported SVG length format: {value!r}")
+    number = float(m.group(1))
+    unit = m.group(2)
+    mm = number * _TO_MM[unit]
+    px = mm * _MM_TO_PX if unit != "px" else number
+    return mm, px
+
+
+def _set_font_size_in_style(style: str, new_size: str) -> str:
+    """Replace or add font-size in a CSS style string."""
+    pairs = [p.strip() for p in style.split(";") if p.strip()]
+    replaced = False
+    result = []
+    for pair in pairs:
+        if ":" in pair:
+            prop, _, val = pair.partition(":")
+            if prop.strip().lower() == "font-size":
+                result.append(f"font-size:{new_size}")
+                replaced = True
+                continue
+        result.append(pair)
+    if not replaced:
+        result.append(f"font-size:{new_size}")
+    return ";".join(result)
+
+
+def _find_data_curves(paths: list) -> list:
+    """Return all data-curve path elements from *paths*.
+
+    A data curve is a path that is both thick (stroke-width > 1 px) and has
+    many path tokens (> 40 numeric values in the ``d`` attribute).  The token
+    count criterion prevents the plot frame and tick marks — which may share
+    the same stroke-width in some LTspice/Inkscape export variants — from
+    being misidentified as curves.
+
+    Falls back to the single path with the most tokens if no path passes both
+    criteria (handles very old or unusual exports).
+    """
+    _num_re = re.compile(r"[+-]?[0-9]*\.?[0-9]+")
+
+    def _is_thick(p):
+        m = re.search(r"stroke-width\s*:\s*([0-9.]+)", p.get("style", ""))
+        return m and float(m.group(1)) > 1.0
+
+    def _token_count(p):
+        return len(_num_re.findall(p.get("d", "")))
+
+    thick_and_long = [p for p in paths if _is_thick(p) and _token_count(p) > 40]
+    if thick_and_long:
+        return thick_and_long
+
+    # Fallback: single path with the most numeric tokens
+    if paths:
+        return [max(paths, key=_token_count)]
+    return []
+
+
+def _find_plot_box(paths: list, data_curves: list):
+    """Return the plot-box path element (the rectangular frame around the graph).
+
+    The plot box is a path that contains both H/h and V/v commands (or is a
+    simple rectangle), and is not one of the data curves.
+    """
+    def _is_rect_path(d: str) -> bool:
+        coords = re.findall(
+            r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)", d
+        )
+        if len(coords) < 4:
+            return False
+        xs = {round(float(c[0]), 2) for c in coords}
+        ys = {round(float(c[1]), 2) for c in coords}
+        return len(xs) == 2 and len(ys) == 2
+
+    data_set = set(id(p) for p in data_curves)
+    for p in paths:
+        if id(p) in data_set:
+            continue
+        d = p.get("d") or ""
+        if (re.search(r"[Hh]", d) and re.search(r"[Vv]", d)) or _is_rect_path(d):
+            return p
+    return None
+
+
+def split_compound_curves(svg_content: str) -> str:
+    """Split any data-curve <path> that encodes multiple curves as subpaths.
+
+    LTspice sometimes exports all traces in a parameter sweep as a single
+    ``<path>`` element whose ``d`` attribute contains several ``M …`` subpaths
+    separated by ``M`` commands.  This function detects such compound paths
+    and replaces each one with N individual ``<path>`` elements — one per
+    subpath — so that downstream functions can colour and label them
+    independently.
+
+    Paths that already consist of a single subpath are left unchanged.
+    """
+    root = etree.fromstring(svg_content.encode())
+    paths = list(root.iter(f"{{{SVG_NS}}}path"))
+    data_curves = _find_data_curves(paths)
+
+    for curve in data_curves:
+        d = curve.get("d", "").strip()
+        # Split on every absolute M that starts a new subpath.
+        # We keep the M together with its subpath.
+        subpath_strings = re.split(r"(?=\s*M\s)", d)
+        subpath_strings = [s.strip() for s in subpath_strings if s.strip()]
+
+        if len(subpath_strings) <= 1:
+            continue  # nothing to split
+
+        parent = curve.getparent()
+        if parent is None:
+            continue
+
+        style  = curve.get("style", "")
+        pos    = list(parent).index(curve)
+
+        # Insert individual paths in place of the compound one
+        for j, subpath_d in enumerate(subpath_strings):
+            new_path = etree.Element(f"{{{SVG_NS}}}path")
+            new_path.set("style", style)
+            new_path.set("d", subpath_d)
+            new_path.set("id", f"{curve.get('id', 'curve')}_sub{j}")
+            parent.insert(pos + j, new_path)
+
+        parent.remove(curve)
+
+    return etree.tostring(root, encoding="unicode")
+
+
+def scale_svg(svg_path, target_width_mm=174.8):
+    """
+    Read *svg_path*, scale it so that its width becomes *target_width_mm* mm,
+    normalise all text/tspan font sizes to 13.3333 px, and return the
+    modified SVG as a Unicode string.  No file is written.
+    """
+    TARGET_FONT = "28.5311px"
+
+    tree = etree.parse(svg_path)
+    root = tree.getroot()
+
+    # ------------------------------------------------------------------ #
+    # 1. Read original dimensions                                          #
+    # ------------------------------------------------------------------ #
+    orig_width_mm, orig_width_px = _parse_length(root.get("width"))
+    orig_height_mm, orig_height_px = _parse_length(root.get("height"))
+
+    # ------------------------------------------------------------------ #
+    # 2. Compute scale factor and new height                              #
+    # ------------------------------------------------------------------ #
+    scale = target_width_mm / orig_width_mm
+    new_height_mm = round(orig_height_mm * scale, 5)
+
+    # ------------------------------------------------------------------ #
+    # 3. Update width / height attributes                                 #
+    # ------------------------------------------------------------------ #
+    root.set("width", "174.8mm")
+    root.set("height", f"{new_height_mm}mm")
+
+    # ------------------------------------------------------------------ #
+    # 4. Set viewBox using original pixel dimensions                      #
+    # ------------------------------------------------------------------ #
+    vb_w = round(orig_width_px, 5)
+    vb_h = round(orig_height_px, 5)
+    root.set("viewBox", f"0 0 {vb_w} {vb_h}")
+
+    # ------------------------------------------------------------------ #
+    # 5. Normalise font sizes                                             #
+    # ------------------------------------------------------------------ #
+    for tag in ("text", "tspan"):
+        for elem in root.iter(f"{{{SVG_NS}}}{tag}"):
+            style = elem.get("style")
+            if style is not None:
+                # Check whether font-size appears in the style string
+                if re.search(r"(?<![a-z-])font-size\s*:", style, re.IGNORECASE):
+                    elem.set("style", _set_font_size_in_style(style, TARGET_FONT))
+                    continue  # style took priority; skip standalone attribute
+
+            # Fallback: standalone font-size attribute
+            if elem.get("font-size") is not None:
+                elem.set("font-size", TARGET_FONT)
+
+    # ------------------------------------------------------------------ #
+    # 6. Serialise and return                                             #
+    # ------------------------------------------------------------------ #
+    return etree.tostring(root, encoding="unicode")
+
+
+def recolor_curve(svg_content: str, color_hex: str) -> str:
+    """
+    Identify the data curve path (longest ``d`` attribute) in the SVG and
+    update its stroke colour and stroke-width.
+
+    Parameters
+    ----------
+    svg_content : str
+        The SVG document as a Unicode string.
+    color_hex : str
+        Six-character hex string **without** the leading ``#``, e.g. ``"e01b24"``.
+
+    Returns
+    -------
+    str
+        The modified SVG as a Unicode string.
+
+    Raises
+    ------
+    ValueError
+        If no ``<path>`` elements are found in the SVG.
+    """
+    root = etree.fromstring(svg_content.encode())
+
+    paths = list(root.iter(f"{{{SVG_NS}}}path"))
+    if not paths:
+        raise ValueError("No path elements found in SVG")
+
+    # The data curve is the single thick path (or longest as fallback).
+    curve = _find_data_curves(paths)[0]
+
+    style = curve.get("style", "")
+    pairs = [p.strip() for p in style.split(";") if p.strip()]
+
+    new_pairs = []
+    for pair in pairs:
+        if ":" in pair:
+            prop, _, val = pair.partition(":")
+            prop_stripped = prop.strip().lower()
+            if prop_stripped == "stroke":
+                new_pairs.append(f"stroke:#{color_hex}")
+                continue
+            if prop_stripped == "stroke-width":
+                new_pairs.append("stroke-width:1.88976378px")
+                continue
+        new_pairs.append(pair)
+
+    curve.set("style", ";".join(new_pairs))
+
+    return etree.tostring(root, encoding="unicode")
+
+
+def remove_legend(svg_content: str) -> str:
+    """Remove the LTspice signal-name legend near the top of the plot."""
+    root = etree.fromstring(svg_content.encode())
+    paths = list(root.iter(f"{{{SVG_NS}}}path"))
+    if not paths:
+        return svg_content
+    data_curves = _find_data_curves(paths)
+    def _is_rect(d):
+        coords = re.findall(r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)", d)
+        if len(coords) < 4: return False
+        return len({round(float(c[0]),2) for c in coords})==2 and len({round(float(c[1]),2) for c in coords})==2
+    plot_box = _find_plot_box(paths, data_curves)
+    if plot_box is None:
+        return svg_content
+    plot_box_d = plot_box.get("d")
+    ml = re.findall(r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)", plot_box_d)
+    xs = [float(c[0]) for c in ml]; ys = [float(c[1]) for c in ml]
+    x_left, x_right, y_top = min(xs), max(xs), min(ys)
+    def _abs_xy(elem):
+        lx = ly = 0.0
+        try: lx = float(elem.get("x", 0) or 0)
+        except ValueError: pass
+        try: ly = float(elem.get("y", 0) or 0)
+        except ValueError: pass
+        t = elem.get("transform", "")
+        m = re.match(r"matrix\s*\([^,]*,[^,]*,[^,]*,[^,]*,\s*([+-]?[\d.e+-]+)\s*,\s*([+-]?[\d.e+-]+)\s*\)", t.strip())
+        if m: return float(m.group(1))+lx, float(m.group(2))+ly
+        return lx, ly
+    text_tag  = f"{{{SVG_NS}}}text"
+    tspan_tag = f"{{{SVG_NS}}}tspan"
+    for elem in list(root.iter(text_tag)):
+        ax, ay = _abs_xy(elem)
+        if x_left <= ax <= x_right and abs(ay - y_top) <= 30:
+            p = elem.getparent()
+            if p is not None: p.remove(elem)
+    return etree.tostring(root, encoding="unicode")
+
+
+def normalize_text_transforms(svg_content: str) -> str:
+    """Bake each <text> transform matrix into x/y and remove the transform.
+
+    For x-axis labels the x coordinate is snapped to the nearest tick mark
+    so that anchor=south (centered) aligns perfectly with the grid lines.
+    For y-axis labels the y coordinate is set to ty (the grid line position).
+    """
+    root = etree.fromstring(svg_content.encode())
+    text_tag  = f"{{{SVG_NS}}}text"
+    tspan_tag = f"{{{SVG_NS}}}tspan"
+
+    _mat_re = re.compile(
+        r"matrix\s*\(\s*"
+        r"([+-]?[\d.e+-]+)\s*,\s*"
+        r"([+-]?[\d.e+-]+)\s*,\s*"
+        r"([+-]?[\d.e+-]+)\s*,\s*"
+        r"([+-]?[\d.e+-]+)\s*,\s*"
+        r"([+-]?[\d.e+-]+)\s*,\s*"
+        r"([+-]?[\d.e+-]+)\s*"
+        r"\)"
+    )
+
+    for elem in root.iter(text_tag):
+        transform = elem.get("transform", "")
+        if not transform:
+            continue
+        m = _mat_re.match(transform.strip())
+        if not m:
+            continue
+        a, b, c, d = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
+        tx, ty = float(m.group(5)), float(m.group(6))
+        if abs(a - 1) > 1e-4 or abs(d - 1) > 1e-4 or abs(b) > 1e-4 or abs(c) > 1e-4:
+            continue
+
+        # x = tx + lx: correct absolute position for both x-axis and y-axis labels.
+        # y = ty: the correct row position (grid line or tick row).
+        # X-axis labels will be further snapped to tick marks in fix_xaxis_labels.
+        try:
+            lx = float(elem.get("x", 0) or 0)
+            ly = float(elem.get("y", 0) or 0)
+        except ValueError:
+            continue
+        x_final = tx + lx
+        y_final = ty + ly
+
+        elem.set("x", f"{x_final:.6f}")
+        elem.set("y", f"{y_final:.6f}")
+        elem.attrib.pop("transform")
+        for tspan in elem.iter(tspan_tag):
+            try:
+                if tspan.get("x") is not None:
+                    tspan.set("x", f"{x_final:.6f}")
+                if tspan.get("y") is not None:
+                    tspan.set("y", f"{y_final:.6f}")
+            except ValueError:
+                pass
+    return etree.tostring(root, encoding="unicode")
+
+
+def fix_xaxis_labels(svg_content: str) -> str:
+    """
+    Format x-axis tick labels: fix decimal separators and ensure correct
+    text anchoring.
+
+    Parameters
+    ----------
+    svg_content : str
+        The SVG document as a Unicode string.
+
+    Returns
+    -------
+    str
+        The modified SVG as a Unicode string.
+    """
+    root = etree.fromstring(svg_content.encode())
+
+    # ------------------------------------------------------------------ #
+    # 1. Find the plot-box path and determine y_bottom                    #
+    # ------------------------------------------------------------------ #
+    paths = list(root.iter(f"{{{SVG_NS}}}path"))
+    if not paths:
+        raise ValueError("No path elements found in SVG")
+
+    data_curves = _find_data_curves(paths)
+    plot_box_path = _find_plot_box(paths, data_curves)
+
+    if plot_box_path is None:
+        raise ValueError("Could not find plot box path in SVG")
+
+    d_attr = plot_box_path.get("d")
+    v_values  = [float(v) for v in re.findall(r"[V]\s*([+-]?[0-9]*\.?[0-9]+)", d_attr)]
+    ml_coords = re.findall(r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)", d_attr)
+    ml_y_values = [float(c[1]) for c in ml_coords]
+    all_y_values = v_values + ml_y_values
+    if not all_y_values:
+        raise ValueError("Could not parse y values from plot box path")
+    y_bottom = max(all_y_values)
+
+    # ------------------------------------------------------------------ #
+    # 2. Identify x-axis tick label <text> elements                       #
+    # ------------------------------------------------------------------ #
+    def _absolute_y(elem):
+        local_y = None
+        y_str = elem.get("y")
+        if y_str is not None:
+            try:
+                local_y = float(y_str)
+            except ValueError:
+                pass
+        if local_y is None:
+            tspan_tag_inner = f"{{{SVG_NS}}}tspan"
+            for child in elem:
+                if child.tag == tspan_tag_inner:
+                    y_str = child.get("y")
+                    if y_str is not None:
+                        try:
+                            local_y = float(y_str)
+                        except ValueError:
+                            pass
+                    break
+        if local_y is None:
+            return None
+        transform = elem.get("transform", "")
+        m = re.match(
+            r"matrix\s*\(\s*[+-]?[\d.e+-]+\s*,\s*[+-]?[\d.e+-]+\s*,"
+            r"\s*[+-]?[\d.e+-]+\s*,\s*[+-]?[\d.e+-]+\s*,"
+            r"\s*[+-]?[\d.e+-]+\s*,\s*([+-]?[\d.e+-]+)\s*\)",
+            transform.strip(),
+        )
+        if m:
+            return float(m.group(1)) + local_y
+        return local_y
+    text_tag  = f"{{{SVG_NS}}}text"
+    tspan_tag = f"{{{SVG_NS}}}tspan"
+
+    xaxis_labels = []
+    for elem in root.iter(text_tag):
+        y = _absolute_y(elem)
+        if y is not None and y > y_bottom:
+            _txt = "".join(c.text or "" for c in elem.iter(tspan_tag)).strip()
+            if re.search(r"[0-9]\s*[mµn]?A", _txt):
+                continue
+            xaxis_labels.append(elem)
+
+    # ------------------------------------------------------------------ #
+    # 3. Update each x-axis label                                         #
+    # ------------------------------------------------------------------ #
+    _decimal_unit_re = re.compile(
+        r"(\d+\.\d+)\s*([A-Za-zµ]+)"   # number with decimal + optional unit
+        r"|(\d+\.\d+)"                  # number with decimal, no unit
+    )
+
+    def _fix_label_text(text: str) -> str:
+        """Replace '.' with ',' in decimal numbers; ensure space before unit."""
+        def replacer(m):
+            if m.group(1) is not None:
+                # number + unit
+                number = m.group(1).replace(".", ",")
+                unit = m.group(2)
+                return f"{number} {unit}"
+            else:
+                # number only
+                return m.group(3).replace(".", ",")
+        return _decimal_unit_re.sub(replacer, text)
+
+    # Snap each x-axis label's x coordinate to the nearest tick mark x.
+    # The tick marks are short vertical SVG path segments M x,y1 L x,y2.
+    _path_tag = f"{{{SVG_NS}}}path"
+    _tick_set = set()
+    for _p in root.iter(_path_tag):
+        _d = _p.get("d", "").strip()
+        _m = re.match(
+            r"M\s+([0-9.]+)[,\s]+([0-9.]+)\s+L\s+\1[,\s]+[0-9.]+\s*$", _d
+        )
+        if _m:
+            _tick_set.add(round(float(_m.group(1)), 3))
+    _tick_list = sorted(_tick_set)
+
+    for text_elem in xaxis_labels:
+        if _tick_list:
+            cur_x = float(text_elem.get("x", 0) or 0)
+            nearest_tick = min(_tick_list, key=lambda t: abs(t - cur_x))
+            if abs(nearest_tick - cur_x) < 30:   # sanity: only snap if close
+                text_elem.set("x", f"{nearest_tick:.6f}")
+                for _ts in text_elem.iter(tspan_tag):
+                    if _ts.get("x") is not None:
+                        _ts.set("x", f"{nearest_tick:.6f}")
+
+        # Update style: middle anchor on text element AND all tspans
+        for node in [text_elem] + list(text_elem.iter(tspan_tag)):
+            st = node.get("style", "")
+            pairs = [p.strip() for p in st.split(";") if p.strip()]
+            pairs = [p for p in pairs
+                     if not p.lower().startswith("text-anchor")
+                     and not p.lower().startswith("text-align")]
+            pairs += ["text-anchor:middle", "text-align:center"]
+            node.set("style", ";".join(pairs))
+
+        # Fix decimal separators
+        for tspan in text_elem.iter(tspan_tag):
+            if tspan.text:
+                tspan.text = _fix_label_text(tspan.text)
+
+    return etree.tostring(root, encoding="unicode")
+
+
+def fix_yaxis_labels(svg_content: str) -> str:
+    """
+    Format y-axis tick labels: fix decimal separators and ensure correct
+    text anchoring.
+
+    Parameters
+    ----------
+    svg_content : str
+        The SVG document as a Unicode string.
+
+    Returns
+    -------
+    str
+        The modified SVG as a Unicode string.
+    """
+    root = etree.fromstring(svg_content.encode())
+
+    # ------------------------------------------------------------------ #
+    # 1. Find the plot-box path and determine x_left                      #
+    # ------------------------------------------------------------------ #
+    paths = list(root.iter(f"{{{SVG_NS}}}path"))
+    if not paths:
+        raise ValueError("No path elements found in SVG")
+
+    data_curves = _find_data_curves(paths)
+    plot_box_path = _find_plot_box(paths, data_curves)
+
+    if plot_box_path is None:
+        raise ValueError("Could not find plot box path in SVG")
+
+    d_attr = plot_box_path.get("d")
+    h_values  = [float(v) for v in re.findall(r"[H]\s*([+-]?[0-9]*\.?[0-9]+)", d_attr)]
+    ml_coords = re.findall(r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)", d_attr)
+    ml_x_values = [float(c[0]) for c in ml_coords]
+    all_x_values = h_values + ml_x_values
+    if not all_x_values:
+        raise ValueError("Could not parse x values from plot box path")
+    x_left = min(all_x_values)
+
+    # ------------------------------------------------------------------ #
+    # 2. Identify y-axis tick label <text> elements                       #
+    # ------------------------------------------------------------------ #
+    def _absolute_x(elem):
+        local_x = None
+        x_str = elem.get("x")
+        if x_str is not None:
+            try:
+                local_x = float(x_str)
+            except ValueError:
+                pass
+        if local_x is None:
+            tspan_tag_inner = f"{{{SVG_NS}}}tspan"
+            for child in elem:
+                if child.tag == tspan_tag_inner:
+                    x_str = child.get("x")
+                    if x_str is not None:
+                        try:
+                            local_x = float(x_str)
+                        except ValueError:
+                            pass
+                    break
+        if local_x is None:
+            return None
+        transform = elem.get("transform", "")
+        m = re.match(
+            r"matrix\s*\(\s*[+-]?[\d.e+-]+\s*,\s*[+-]?[\d.e+-]+\s*,"
+            r"\s*[+-]?[\d.e+-]+\s*,\s*[+-]?[\d.e+-]+\s*,"
+            r"\s*([+-]?[\d.e+-]+)\s*,\s*[+-]?[\d.e+-]+\s*\)",
+            transform.strip(),
+        )
+        if m:
+            return float(m.group(1)) + local_x
+        return local_x
+    text_tag  = f"{{{SVG_NS}}}text"
+    tspan_tag = f"{{{SVG_NS}}}tspan"
+
+    yaxis_labels = []
+    for elem in root.iter(text_tag):
+        x = _absolute_x(elem)
+        if x is not None and x < x_left:
+            # Skip labels already tagged as x-axis labels (text-anchor:middle)
+            if "text-anchor:middle" in elem.get("style", ""):
+                continue
+            yaxis_labels.append(elem)
+
+    # ------------------------------------------------------------------ #
+    # 3. Update each y-axis label                                         #
+    # ------------------------------------------------------------------ #
+    _label_re = re.compile(
+        r"(\d+\.\d+)\s*([A-Za-zµ]+)"
+        r"|(\d+\.\d+)"
+        r"|(\d+)\s*([A-Za-zµ]+)"
+    )
+
+    def _fix_label_text(text: str) -> str:
+        def replacer(m):
+            if m.group(1) is not None:
+                return f"{m.group(1).replace('.', ',')} {m.group(2)}"
+            elif m.group(3) is not None:
+                return m.group(3).replace(".", ",")
+            else:
+                return f"{m.group(4)} {m.group(5)}"
+        return _label_re.sub(replacer, text)
+
+    # Snap all y-axis labels to the same x (the leftmost one) so they align uniformly.
+    if yaxis_labels:
+        unified_x = min(
+            float(e.get("x", 0) or 0) for e in yaxis_labels
+        )
+    else:
+        unified_x = None
+
+    for text_elem in yaxis_labels:
+        # 3a. Snap x position so all labels share the same right edge.
+        if unified_x is not None:
+            text_elem.set("x", f"{unified_x:.6f}")
+            for tspan in text_elem.iter(tspan_tag):
+                if tspan.get("x") is not None:
+                    tspan.set("x", f"{unified_x:.6f}")
+
+        # 3b. Update style: set text-anchor=end and text-align=end
+        style = text_elem.get("style", "")
+        pairs = [p.strip() for p in style.split(";") if p.strip()]
+
+        new_pairs = []
+        found_anchor = False
+        found_align = False
+        for pair in pairs:
+            if ":" in pair:
+                prop, _, val = pair.partition(":")
+                prop_stripped = prop.strip().lower()
+                if prop_stripped == "text-anchor":
+                    new_pairs.append("text-anchor:end")
+                    found_anchor = True
+                    continue
+                if prop_stripped == "text-align":
+                    new_pairs.append("text-align:end")
+                    found_align = True
+                    continue
+            new_pairs.append(pair)
+        if not found_anchor:
+            new_pairs.append("text-anchor:end")
+        if not found_align:
+            new_pairs.append("text-align:end")
+        text_elem.set("style", ";".join(new_pairs))
+
+        # 3c. Propagate text-anchor:end to all tspans (for svg right-alignment)
+        for tspan in text_elem.iter(tspan_tag):
+            ts_style = tspan.get("style", "")
+            ts_pairs = [p.strip() for p in ts_style.split(";") if p.strip()]
+            ts_pairs = [p for p in ts_pairs
+                        if not p.lower().startswith("text-anchor")
+                        and not p.lower().startswith("text-align")]
+            ts_pairs += ["text-anchor:end", "text-align:end"]
+            tspan.set("style", ";".join(ts_pairs))
+            if tspan.text:
+                tspan.text = _fix_label_text(tspan.text)
+
+    return etree.tostring(root, encoding="unicode")
+
+
+def add_xlabel(svg_content: str, xlabel: str) -> str:
+    """Add x-axis label below tick labels using sentinel for LaTeX passthrough."""
+    root = etree.fromstring(svg_content.encode())
+    paths = list(root.iter(f"{{{SVG_NS}}}path"))
+    if not paths:
+        raise ValueError("No path elements found in SVG")
+
+    data_curves = _find_data_curves(paths)
+    plot_box_path = _find_plot_box(paths, data_curves)
+    if plot_box_path is None:
+        raise ValueError("Could not find plot box path in SVG")
+
+    d_attr = plot_box_path.get("d")
+    ml_coords = re.findall(r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)", d_attr)
+    xs = [float(c[0]) for c in ml_coords]; ys = [float(c[1]) for c in ml_coords]
+    y_bottom = max(ys)
+    TICK_FONT = 28.5311; TICK_GAP = 4; XLABEL_FONT = 28.5311
+
+    text_tag  = f"{{{SVG_NS}}}text"
+    tspan_tag = f"{{{SVG_NS}}}tspan"
+    tick_xs = []
+    for elem in root.iter(text_tag):
+        y = float(elem.get("y", 0) or 0)
+        if y > y_bottom:
+            txt = "".join(c.text or "" for c in elem.iter(tspan_tag)).strip()
+            if re.search(r"[0-9]\s*[mµn]?A", txt): continue
+            try: tick_xs.append(float(elem.get("x", 0) or 0))
+            except ValueError: pass
+    tick_ys = []
+    for elem in root.iter(text_tag):
+        y = float(elem.get("y", 0) or 0)
+        if y > y_bottom:
+            txt = "".join(c.text or "" for c in elem.iter(tspan_tag)).strip()
+            if re.search(r"[0-9]\s*[mµn]?A", txt): continue
+            try: tick_ys.append(y)
+            except ValueError: pass
+
+    if len(tick_xs) >= 2:
+        caption_x = (min(tick_xs) + max(tick_xs)) / 2
+    else:
+        caption_x = (min(xs) + max(xs)) / 2
+
+    # Shift x-axis tick labels 2.5 mm down and xlabel 7.5 mm down.
+    # (Reduced by 2.5 mm each to move ticks and label 2.5 mm upward.)
+    SHIFT_TICK_PX  = 12.5 * _MM_TO_PX   # 2.5 mm less = 2.5 mm upward
+    SHIFT_LABEL_PX = 22.5 * _MM_TO_PX  # 2.5 mm less = 2.5 mm upward
+
+    # Apply tick-label y shift to ALL x-axis tick labels.
+    for elem in root.iter(text_tag):
+        y = float(elem.get("y", 0) or 0)
+        if y > y_bottom:
+            txt = "".join(c.text or "" for c in elem.iter(tspan_tag)).strip()
+            if re.search(r"[0-9]\s*[mµn]?A", txt):
+                continue
+            new_y = y + SHIFT_TICK_PX
+            elem.set("y", f"{new_y:.6f}")
+            for ts in elem.iter(tspan_tag):
+                if ts.get("y") is not None:
+                    ts.set("y", f"{new_y:.6f}")
+
+    # Collect tick_ys after shift for correct caption_y
+    tick_ys_shifted = []
+    for elem in root.iter(text_tag):
+        y = float(elem.get("y", 0) or 0)
+        if y > y_bottom:
+            txt = "".join(c.text or "" for c in elem.iter(tspan_tag)).strip()
+            if re.search(r"[0-9]\s*[mµn]?A", txt):
+                continue
+            tick_ys_shifted.append(y)
+
+    max_tick_y = max(tick_ys_shifted) if tick_ys_shifted else y_bottom + TICK_GAP + TICK_FONT
+    caption_y = max_tick_y + XLABEL_FONT + 4 + SHIFT_LABEL_PX - SHIFT_TICK_PX
+
+    vb = root.get("viewBox")
+    if vb:
+        vb_parts = vb.split()
+        if len(vb_parts) == 4:
+            vb_h = float(vb_parts[3])
+            needed_h = caption_y + 4
+            if needed_h > vb_h:
+                vb_parts[3] = f"{needed_h:.4f}"
+                root.set("viewBox", " ".join(vb_parts))
+                # Derive the mm-per-viewBox-px ratio from the known width.
+                # width is always "174.8mm"; viewBox width gives the px scale.
+                vb_w_cur = float(vb_parts[2])
+                mm_per_vb_px = 174.8 / vb_w_cur
+                root.set("height", f"{needed_h * mm_per_vb_px:.5f}mm")
+
+    new_text = etree.SubElement(root, f"{{{SVG_NS}}}text")
+    new_text.set("x", f"{caption_x:.4f}")
+    new_text.set("y", f"{caption_y:.4f}")
+    new_text.set("id", "LTSPICE2TIKZ_XLABEL")
+    new_text.set("style",
+        f"font-style:normal;font-weight:bold;font-size:{XLABEL_FONT}px;"
+        "font-family:Arial;text-anchor:middle;text-align:center;fill:#000000")
+    new_text.text = "%%XLABEL%%"
+    return etree.tostring(root, encoding="unicode")
+
+
+def add_ylabel(svg_content: str, ylabel: str) -> str:
+    """Add y-axis label to the left of tick labels using sentinel for LaTeX passthrough."""
+    root = etree.fromstring(svg_content.encode())
+    paths = list(root.iter(f"{{{SVG_NS}}}path"))
+    if not paths:
+        raise ValueError("No path elements found in SVG")
+
+    data_curves = _find_data_curves(paths)
+    plot_box_path = _find_plot_box(paths, data_curves)
+    if plot_box_path is None:
+        raise ValueError("Could not find plot box path in SVG")
+
+    def _abs_x(elem):
+        lx = 0.0
+        try: lx = float(elem.get("x", 0) or 0)
+        except ValueError: pass
+        t = elem.get("transform", "")
+        m = re.match(r"matrix\s*\([^,]*,[^,]*,[^,]*,[^,]*,\s*([+-]?[\d.e+-]+)", t.strip())
+        if m: return float(m.group(1)) + lx
+        return lx
+
+    d_attr = plot_box_path.get("d")
+    ml_coords = re.findall(r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)", d_attr)
+    xs = [float(c[0]) for c in ml_coords]; ys = [float(c[1]) for c in ml_coords]
+    x_left = min(xs); y_top = min(ys); y_bottom = max(ys)
+    y_center = (y_top + y_bottom) / 2
+
+    text_tag = f"{{{SVG_NS}}}text"
+    YLABEL_FONT = 28.5311; GAP = 4
+    min_tick_x = None
+    for elem in root.iter(text_tag):
+        x = _abs_x(elem)
+        if x < x_left and "text-anchor:middle" not in elem.get("style", ""):
+            if min_tick_x is None or x < min_tick_x:
+                min_tick_x = x
+    if min_tick_x is None:
+        raise ValueError("Could not find any y-axis tick label text elements")
+
+    x_pos = min_tick_x - GAP
+
+    # Horizontal ylabel: shift further left from x_pos.
+    # Increased by 5 mm (original was 25 mm) to move label 5 mm to the left.
+    YLABEL_EXTRA_LEFT = 30.0 * _MM_TO_PX  # 10 mm extra gap in SVG px
+    x_label = x_pos - YLABEL_EXTRA_LEFT   # text-anchor:end => right edge here
+
+    # Expand viewBox left if the label would extend beyond the current left edge.
+    # Estimate label width generously (font-size * 0.6 * ~10 chars).
+    # The physical width stays 174.8mm; only the viewBox origin shifts left and
+    # its width grows — the SVG simply shows more canvas to the left.
+    YLABEL_ESTIMATED_WIDTH = YLABEL_FONT * 0.6 * 10
+    vb = root.get("viewBox")
+    if vb:
+        vb_parts = vb.split()
+        if len(vb_parts) == 4:
+            vb_x = float(vb_parts[0])
+            needed_x = x_label - YLABEL_ESTIMATED_WIDTH - 4
+            if needed_x < vb_x:
+                x_shift = vb_x - needed_x
+                vb_parts[0] = f"{needed_x:.4f}"
+                vb_w = float(vb_parts[2]) + x_shift
+                vb_parts[2] = f"{vb_w:.4f}"
+                root.set("viewBox", " ".join(vb_parts))
+                # width stays 174.8mm — viewBox expansion makes it visible
+
+    new_text = etree.SubElement(root, f"{{{SVG_NS}}}text")
+    new_text.set("x", f"{x_label:.4f}")
+    new_text.set("y", f"{y_center:.4f}")
+    new_text.set("id", "LTSPICE2TIKZ_YLABEL")
+    new_text.set("style",
+        f"font-style:normal;font-weight:bold;font-size:{YLABEL_FONT}px;"
+        "font-family:Arial;text-anchor:end;text-align:end;fill:#000000")
+    new_text.text = "%%YLABEL%%"
+    return etree.tostring(root, encoding="unicode")
+
+
+
+def crop_to_content(svg_content: str, margin_mm: float = 1.0) -> str:
+    """
+    Adjust the SVG viewBox and physical dimensions to tightly fit all content,
+    with an optional margin in mm.  Uses lxml to collect all coordinate data
+    from path d-attributes and text x/y positions (transforms already baked in
+    by normalize_text_transforms).
+
+    Text y-coordinates are baselines, not bounding-box bottoms.  To avoid
+    over-estimating the height, we add a descender allowance (20 % of font
+    size) only for text elements below the plot box, and subtract an ascender
+    offset (80 % of font size) for the topmost text.
+    """
+    root = etree.fromstring(svg_content.encode())
+
+    xs, ys_path = [], []
+    text_ys = []   # (y_baseline, font_size_px)
+
+    # Collect from path d attributes
+    for elem in root.iter(f"{{{SVG_NS}}}path"):
+        d = elem.get("d", "")
+        for x, y in re.findall(
+            r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)", d
+        ):
+            xs.append(float(x)); ys_path.append(float(y))
+
+    # Collect from text/tspan x/y — store separately with font size
+    _fs_re = re.compile(r"font-size\s*:\s*([0-9.]+)\s*px", re.IGNORECASE)
+    for tag in ("text", "tspan"):
+        for elem in root.iter(f"{{{SVG_NS}}}{tag}"):
+            # x
+            xval = elem.get("x")
+            if xval is not None:
+                try: xs.append(float(xval))
+                except ValueError: pass
+            # y + font size
+            yval = elem.get("y")
+            if yval is not None:
+                try:
+                    y_f = float(yval)
+                    # Determine font size from style or attribute
+                    fs = 28.5311  # default
+                    style = elem.get("style", "")
+                    m_fs = _fs_re.search(style)
+                    if m_fs:
+                        fs = float(m_fs.group(1))
+                    else:
+                        fa = elem.get("font-size", "")
+                        m_fa = re.match(r"([0-9.]+)\s*px", fa)
+                        if m_fa:
+                            fs = float(m_fa.group(1))
+                    text_ys.append((y_f, fs))
+                except ValueError:
+                    pass
+
+    if not xs or (not ys_path and not text_ys):
+        return svg_content
+
+    # Derive viewBox scale: width is always 174.8mm
+    vb = root.get("viewBox", "")
+    vb_parts = vb.split()
+    if len(vb_parts) != 4:
+        return svg_content
+    vb_w = float(vb_parts[2])
+    mm_per_vb_px = 174.8 / vb_w
+    margin_px = margin_mm / mm_per_vb_px
+
+    all_ys = ys_path[:]
+    for y_baseline, fs in text_ys:
+        # Top of glyph ≈ baseline − ascender (0.8 × fs)
+        all_ys.append(y_baseline - 0.8 * fs)
+        # Bottom of glyph ≈ baseline + descender (0.2 × fs)
+        all_ys.append(y_baseline + 0.2 * fs)
+
+    min_x = min(xs) - margin_px
+    min_y = min(all_ys) - margin_px
+    max_x = max(xs) + margin_px
+    max_y = max(all_ys) + margin_px
+
+    new_vb_w = max_x - min_x
+    new_vb_h = max_y - min_y
+
+    root.set("viewBox", f"{min_x:.4f} {min_y:.4f} {new_vb_w:.4f} {new_vb_h:.4f}")
+    root.set("width",  f"{new_vb_w * mm_per_vb_px:.5f}mm")
+    root.set("height", f"{new_vb_h * mm_per_vb_px:.5f}mm")
+
+    return etree.tostring(root, encoding="unicode")
+
+def convert_emf_to_svg(emf_path):
+    """Convert an EMF file to SVG using Inkscape and return the temp SVG path."""
+    if shutil.which("inkscape") is None:
+        print(
+            "Error: inkscape not found. Please install Inkscape and ensure it is on PATH.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".svg", delete=False)
+    tmp_svg_path = tmp.name
+    tmp.close()
+
+    result = subprocess.run(
+        ["inkscape", f"--export-type=svg", f"--export-filename={tmp_svg_path}", emf_path],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    return tmp_svg_path
+
+
+def _shift_labels(tikz_code: str) -> str:
+    """Shift x-axis tick labels 2.5 pt down and xlabel 7.5 pt down.
+    (Reduced by 7.09 pt ≈ 2.5 mm each compared to the previous version.)
+    1 pt = 2.54/72 cm in TikZ coordinate space (x=1cm, y=1cm axes)."""
+    import re as _re
+    PT = 2.54 / 72  # cm per typographic point
+
+    lines = tikz_code.split("\n")
+    result = []
+    for line in lines:
+        # x-axis tick labels: node with V in text content, y < 0.8 cm
+        if ("V}" in line
+                and "XLABEL" not in line and "YLABEL" not in line
+                and ("anchor=south" in line or "anchor=base" in line)):
+            m = _re.search(r"at \((-?[0-9.]+), (-?[0-9.]+)\)", line)
+            if m and float(m.group(2)) < 0.8:
+                x, y = float(m.group(1)), float(m.group(2))
+                new_y = y - (10 * PT - 2.5 / 10)  # 10 pt down, minus 2.5 mm
+                line = line[:m.start()] + f"at ({x:.4f}, {new_y:.4f})" + line[m.end():]
+        # xlabel
+        elif "LTSPICE2TIKZ_XLABEL" in line:
+            m = _re.search(r"at \((-?[0-9.]+), (-?[0-9.]+)\)", line)
+            if m:
+                x, y = float(m.group(1)), float(m.group(2))
+                new_y = y - (15 * PT - 2.5 / 10)  # 15 pt down, 2.5 mm less
+                line = line[:m.start()] + f"at ({x:.4f}, {new_y:.4f})" + line[m.end():]
+        result.append(line)
+    return "\n".join(result)
+
+
+def _strip_document_wrapper(tikz_code: str) -> str:
+    """Remove the standalone \\documentclass...\\begin{document} wrapper
+    that svg2tikz adds, keeping only the tikzpicture content."""
+    import re as _re
+    # If it contains \begin{document}, extract only what's inside
+    m = _re.search(r"\\begin\{document\}(.*?)\\end\{document\}", tikz_code, _re.DOTALL)
+    if m:
+        return m.group(1).strip() + "\n"
+    return tikz_code
+
+
+def run_s2t(svg_content: str, output_tex_path: str,
+            xlabel: str = "", ylabel: str = "") -> None:
+    """Convert SVG to TikZ, replace sentinels with raw LaTeX labels."""
+
+    def _replace_sentinel(code, node_id, label):
+        label = label.strip()
+        lines = code.split("\n")
+        result = []
+
+        if node_id == "LTSPICE2TIKZ_YLABEL":
+            import re as _re2
+            # Collect right-edge x of all y-axis tick labels (left side of plot)
+            tick_right_xs = []
+            for pat in (r"anchor=south east\] \(\w+\) at \((-?[0-9.]+),",
+                        r"anchor=base east\] \(\w+\) at \((-?[0-9.]+),"):
+                tick_right_xs += [float(m) for m in _re2.findall(pat, code)
+                                  if float(m) < 1.0]
+
+            # Get y-center from the existing YLABEL node
+            for line in lines:
+                if "(" + node_id + ")" in line:
+                    m2 = _re2.search(r"at \((-?[0-9.]+), ([0-9.]+)\)", line)
+                    if m2:
+                        y_center = float(m2.group(2))
+                        if tick_right_xs:
+                            # Position ylabel to the left of tick labels.
+                            # Tick labels render at document font (10pt).
+                            # 10pt em = 0.353cm; "750 mA" ≈ 6 chars ≈ 1.1cm wide.
+                            # Right-edge of ylabel = leftmost_tick_right_edge
+                            #                       - tick_label_width(10pt) - gap
+                            tick_label_width = 1.4   # cm at 10pt (generous for 10pt font)
+                            gap = 0.15               # cm gap between ylabel and ticks
+                            x_ylabel = min(tick_right_xs) - tick_label_width - gap
+                        else:
+                            x_ylabel = float(m2.group(1))
+                        # Horizontal label, right-aligned (anchor=east)
+                        new_line = (
+                            f"  \\node[text=black,anchor=east]"
+                            f" ({node_id}) at ({x_ylabel:.4f}, {y_center:.4f})"
+                            "{" + label + "};"
+                        )
+                        result.append(new_line)
+                    else:
+                        result.append(line)
+                else:
+                    result.append(line)
+            return "\n".join(result)
+
+        for line in lines:
+            if "(" + node_id + ")" in line:
+                line = re.sub(r"\{[^}]*\}\s*;\s*$",
+                              lambda _m, _l=label: "{" + _l + "};", line)
+            result.append(line)
+        return "\n".join(result)
+
+    # Save the final processed SVG alongside the output .tex file.
+    # Replace the %%XLABEL%%/%%YLABEL%% sentinels with the actual labels so the
+    # SVG is useful for inspection and does not contain placeholder text.
+    _svg_for_save = svg_content
+    if xlabel:
+        _svg_for_save = _svg_for_save.replace("%%XLABEL%%", xlabel)
+    if ylabel:
+        _svg_for_save = _svg_for_save.replace("%%YLABEL%%", ylabel)
+    _svg_out = os.path.splitext(output_tex_path)[0] + ".svg"
+    with open(_svg_out, "w", encoding="utf-8") as _fh:
+        _fh.write(_svg_for_save)
+    print(f"Final SVG saved to: {_svg_out}")
+
+    def _run_and_postprocess(tikz_code):
+        if xlabel:
+            tikz_code = _replace_sentinel(tikz_code, "LTSPICE2TIKZ_XLABEL", xlabel)
+        if ylabel:
+            tikz_code = _replace_sentinel(tikz_code, "LTSPICE2TIKZ_YLABEL", ylabel)
+        tikz_code = _strip_document_wrapper(tikz_code)
+        tikz_code = _shift_labels(tikz_code)
+        with open(output_tex_path, "w", encoding="utf-8") as _fh:
+            _fh.write(tikz_code)
+        print(f"Done: {output_tex_path}")
+
+    # Prefer s2t CLI — output streams directly to terminal
+    if shutil.which("s2t") is not None:
+        _svg_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".svg",
+                                               delete=False, encoding="utf-8")
+        _svg_tmp.write(svg_content)
+        _svg_tmp.close()
+        try:
+            _res = subprocess.run(
+                ["s2t", _svg_tmp.name, "--output", output_tex_path, "--textwidth", "174.8"],
+            )
+            if _res.returncode != 0:
+                sys.exit(1)
+        finally:
+            shutil.move(_svg_tmp.name,
+                        os.path.join("/tmp", os.path.basename(_svg_tmp.name)))
+        with open(output_tex_path, encoding="utf-8") as _fh:
+            tikz_code = _fh.read()
+        _run_and_postprocess(tikz_code)
+        return
+
+    # Fallback: svg2tikz Python API
+    try:
+        import svg2tikz as _s2t_mod
+        _saved_argv = sys.argv[:]
+        sys.argv = sys.argv[:1]
+        try:
+            tikz_code = _s2t_mod.convert_svg(svg_content, no_output=True, returnstring=True)
+        finally:
+            sys.argv = _saved_argv
+        _run_and_postprocess(tikz_code)
+        return
+    except Exception as e:
+        print(f"svg2tikz Python API failed: {e}", file=sys.stderr)
+
+    print("Error: neither s2t nor svg2tikz Python API available.", file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert LTspice EMF output files to processed SVG."
+    )
+
+    parser.add_argument(
+        "input",
+        help="Path to the input file.",
+    )
+    parser.add_argument(
+        "--xlabel",
+        required=True,
+        metavar="TEXT",
+        help="Label for the x-axis.",
+    )
+    parser.add_argument(
+        "--ylabel",
+        required=True,
+        metavar="TEXT",
+        help="Label for the y-axis.",
+    )
+    parser.add_argument(
+        "--color",
+        default="e01b24",
+        metavar="HEX",
+        help="Plot colour as a hex string (default: e01b24).",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path for the output .svg file. "
+            "Defaults to the input filename with its extension replaced by .svg."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    # Warn if a label looks like it had shell variable expansion applied:
+    # e.g. "$U\indextext{GS}$" with double quotes becomes "\indextext{GS}$"
+    for _lname, _lval in [("--xlabel", args.xlabel), ("--ylabel", args.ylabel)]:
+        if "\\" in _lval and "$" not in _lval:
+            print(
+                f"Warning: {_lname} value {_lval!r} starts with backslash but not '$'.\n"
+                "  Likely cause: shell expanded $VAR in double-quoted string.\n"
+                "  Use single quotes to prevent this:\n"
+                f"  {_lname} \'$...your_label...$\'",
+                file=sys.stderr,
+            )
+
+    # If the input path has no extension, try appending .emf automatically.
+    if not os.path.splitext(args.input)[1]:
+        emf_candidate = args.input + ".emf"
+        if os.path.exists(emf_candidate):
+            args.input = emf_candidate
+
+    # Resolve default output path based on the (possibly resolved) input path.
+    if args.output is None:
+        base, _ = os.path.splitext(args.input)
+        args.output = base + ".svg"
+
+    # Validate that the input file exists.
+    if not os.path.exists(args.input):
+        print(f"Error: file not found: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    tmp_svg_path = convert_emf_to_svg(args.input)
+
+    try:
+        svg_content = scale_svg(tmp_svg_path)
+        svg_content = normalize_text_transforms(svg_content)
+        svg_content = recolor_curve(svg_content, args.color)
+        svg_content = remove_legend(svg_content)
+        svg_content = fix_xaxis_labels(svg_content)
+        svg_content = fix_yaxis_labels(svg_content)
+        svg_content = add_xlabel(svg_content, args.xlabel)
+        svg_content = add_ylabel(svg_content, args.ylabel)
+
+        # Replace %%XLABEL%% / %%YLABEL%% sentinels with the actual label text.
+        if args.xlabel:
+            svg_content = svg_content.replace("%%XLABEL%%", args.xlabel)
+        if args.ylabel:
+            svg_content = svg_content.replace("%%YLABEL%%", args.ylabel)
+
+        svg_content = crop_to_content(svg_content, margin_mm=2.0)
+
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(svg_content)
+        print(f"Done: {args.output}")
+    finally:
+        if os.path.exists(tmp_svg_path):
+            os.remove(tmp_svg_path)
+
+
+if __name__ == "__main__":
+    main()

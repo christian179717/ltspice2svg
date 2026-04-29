@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+ltspice2svg_multi — Multi-curve wrapper around ltspice2svg.
+
+Each curve is assigned a distinct colour from the GNOME High Colors palette
+(ordered for maximum contrast) and labelled inline at the right end of the
+curve.  All shared processing (scaling, axis labels, cropping, …) is
+delegated to ltspice2svg so changes there are automatically inherited.
+
+Usage example
+-------------
+    ltspice2svg_multi input.emf \\
+        --xlabel '$U_{\\mathrm{DS}}$' \\
+        --ylabel '$I_{\\mathrm{D}}$' \\
+        --clabels '$U_{\\mathrm{GS}}=1{,}5\\,\\mathrm{V}$' \\
+                  '$U_{\\mathrm{GS}}=2{,}0\\,\\mathrm{V}$' \\
+                  '$U_{\\mathrm{GS}}=2{,}5\\,\\mathrm{V}$'
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shutil
+import sys
+
+from lxml import etree
+
+# ---------------------------------------------------------------------------
+# Locate and import ltspice2svg as a module at runtime.
+# The script is installed without a .py extension, so we use importlib.
+# ---------------------------------------------------------------------------
+
+def _load_ltspice2svg():
+    # 1. Same directory as this script
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(here, "ltspice2svg")
+    if os.path.isfile(candidate):
+        return candidate
+    # 2. Anywhere on PATH
+    found = shutil.which("ltspice2svg")
+    if found:
+        return found
+    print("Error: ltspice2svg not found next to this script or on PATH.", file=sys.stderr)
+    sys.exit(1)
+
+_spec = importlib.util.spec_from_loader(
+    "ltspice2svg",
+    importlib.machinery.SourceFileLoader("ltspice2svg", _load_ltspice2svg()),
+)
+_l2s  = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_l2s)
+
+# Re-export the symbols we use
+SVG_NS                    = _l2s.SVG_NS
+_MM_TO_PX                 = _l2s._MM_TO_PX
+_find_data_curves         = _l2s._find_data_curves
+_find_plot_box            = _l2s._find_plot_box
+split_compound_curves     = _l2s.split_compound_curves
+convert_emf_to_svg        = _l2s.convert_emf_to_svg
+scale_svg                 = _l2s.scale_svg
+normalize_text_transforms = _l2s.normalize_text_transforms
+remove_legend             = _l2s.remove_legend
+fix_xaxis_labels          = _l2s.fix_xaxis_labels
+fix_yaxis_labels          = _l2s.fix_yaxis_labels
+add_xlabel                = _l2s.add_xlabel
+add_ylabel                = _l2s.add_ylabel
+crop_to_content           = _l2s.crop_to_content
+
+# ---------------------------------------------------------------------------
+# GNOME High Colors — ordered for maximum pairwise contrast
+# ---------------------------------------------------------------------------
+GNOME_HIGH_COLORS = [
+    "#e01b24",  # Red 4
+    "#1c71d8",  # Blue 4
+    "#2ec27e",  # Green 4
+    "#e5a50a",  # Yellow 4
+    "#9141ac",  # Purple 4
+    "#c64600",  # Orange 4
+    "#63452c",  # Brown 4
+    "#3d3846",  # Dark 4
+    "#26a269",  # Green 3
+    "#1a5fb4",  # Blue 5
+]
+
+
+# ---------------------------------------------------------------------------
+# Multi-curve specific functions
+# ---------------------------------------------------------------------------
+
+def _sorted_curves(paths: list) -> list:
+    """Return data curves sorted by start-y descending (bottom of plot first)."""
+    curves = _find_data_curves(paths)
+
+    def _start_y(p):
+        m = re.match(r"[Mm]\s*([+-]?[0-9.]+)[,\s]+([+-]?[0-9.]+)",
+                     (p.get("d") or "").strip())
+        return float(m.group(2)) if m else 0.0
+
+    curves.sort(key=_start_y, reverse=True)
+    return curves
+
+
+def recolor_curves(svg_content: str, colors: list) -> str:
+    """Assign each data curve a colour from *colors* (hex strings with #)."""
+    root = etree.fromstring(svg_content.encode())
+    curves = _sorted_curves(list(root.iter(f"{{{SVG_NS}}}path")))
+
+    for i, curve in enumerate(curves):
+        color = colors[i % len(colors)]
+        style = curve.get("style", "")
+        pairs = [p.strip() for p in style.split(";") if p.strip()]
+        new_pairs = []
+        for pair in pairs:
+            if ":" in pair:
+                prop, _, _ = pair.partition(":")
+                ps = prop.strip().lower()
+                if ps == "stroke":
+                    new_pairs.append(f"stroke:{color}"); continue
+                if ps == "stroke-width":
+                    new_pairs.append("stroke-width:1.88976378px"); continue
+            new_pairs.append(pair)
+        curve.set("style", ";".join(new_pairs))
+
+    return etree.tostring(root, encoding="unicode")
+
+
+def add_curve_labels(svg_content: str, labels: list, colors: list) -> str:
+    """Add an inline label inside the plot, right-aligned at the right edge,
+    at the y-coordinate where each curve meets the right boundary."""
+    root = etree.fromstring(svg_content.encode())
+    all_paths = list(root.iter(f"{{{SVG_NS}}}path"))
+    curves    = _sorted_curves(all_paths)
+    plot_box  = _find_plot_box(all_paths, curves)
+
+    # Right edge of plot box
+    x_right = None
+    if plot_box is not None:
+        ml = re.findall(
+            r"[ML]\s*([+-]?[0-9]*\.?[0-9]+)[,\s]+([+-]?[0-9]*\.?[0-9]+)",
+            plot_box.get("d", ""),
+        )
+        if ml:
+            x_right = max(float(c[0]) for c in ml)
+
+    if len(curves) != len(labels):
+        print(
+            f"Warning: {len(labels)} label(s) given but {len(curves)} curve(s) detected. "
+            "Labels will be matched to curves in order; extras are ignored or curves left unlabelled.",
+            file=__import__("sys").stderr,
+        )
+
+    n = min(len(curves), len(labels))
+    curves = curves[:n]
+    labels = list(labels)[:n]
+    colors = list(colors)[:n]
+
+    LABEL_FONT = 28.5311
+    GAP = 6  # px gap from the right edge inward
+
+    def _walk_path(d):
+        """Walk an SVG path d-string and return all (x, y) points.
+        Handles absolute M/L/H/V and relative m/l/h/v, including implicit
+        lineto coordinates that follow an m/M command."""
+        # Tokenise: split into (command_letter, [numbers...]) segments.
+        # Numbers that follow a command without an intervening letter are
+        # continuations of the previous command (implicit lineto after m/M).
+        token_re = re.compile(
+            r"([MLHVmlhv])|([+-]?(?:[0-9]*\.)?[0-9]+(?:[eE][+-]?[0-9]+)?)"
+        )
+        tokens = token_re.findall(d)
+
+        segments = []   # list of (cmd_letter, [floats])
+        current_cmd = None
+        current_nums = []
+        for letter, number in tokens:
+            if letter:
+                if current_cmd is not None:
+                    segments.append((current_cmd, current_nums))
+                current_cmd = letter
+                current_nums = []
+            elif number:
+                current_nums.append(float(number))
+        if current_cmd is not None:
+            segments.append((current_cmd, current_nums))
+
+        points = []
+        cx = cy = 0.0
+        for cmd, nums in segments:
+            if cmd == "M":
+                pairs = list(zip(nums[0::2], nums[1::2]))
+                if pairs:
+                    cx, cy = pairs[0]; points.append((cx, cy))
+                    for x, y in pairs[1:]:   # implicit L after M
+                        cx, cy = x, y; points.append((cx, cy))
+            elif cmd == "m":
+                pairs = list(zip(nums[0::2], nums[1::2]))
+                if pairs:
+                    cx += pairs[0][0]; cy += pairs[0][1]; points.append((cx, cy))
+                    for dx, dy in pairs[1:]:  # implicit l after m
+                        cx += dx; cy += dy; points.append((cx, cy))
+            elif cmd == "L":
+                for x, y in zip(nums[0::2], nums[1::2]):
+                    cx, cy = x, y; points.append((cx, cy))
+            elif cmd == "l":
+                for dx, dy in zip(nums[0::2], nums[1::2]):
+                    cx += dx; cy += dy; points.append((cx, cy))
+            elif cmd == "H":
+                for x in nums:
+                    cx = x; points.append((cx, cy))
+            elif cmd == "h":
+                for dx in nums:
+                    cx += dx; points.append((cx, cy))
+            elif cmd == "V":
+                for y in nums:
+                    cy = y; points.append((cx, cy))
+            elif cmd == "v":
+                for dy in nums:
+                    cy += dy; points.append((cx, cy))
+        return points
+
+    # For each curve find the y-coordinate at its rightmost point
+    label_positions = []
+    for curve in curves:
+        points = _walk_path(curve.get("d", ""))
+        label_positions.append(max(points, key=lambda p: p[0]) if points else (0.0, 0.0))
+
+    # Label x: slightly inside the right edge, right-aligned
+    label_x = (x_right - GAP) if x_right is not None \
+              else (max(lp[0] for lp in label_positions) - GAP)
+
+    # Spread labels that are too close vertically
+    MIN_SPACING = LABEL_FONT * 1.2
+    indexed = sorted(enumerate(label_positions), key=lambda x: x[1][1])
+    adj_ys = [lp[1] for _, lp in indexed]
+    for i in range(1, len(adj_ys)):
+        if adj_ys[i] - adj_ys[i - 1] < MIN_SPACING:
+            adj_ys[i] = adj_ys[i - 1] + MIN_SPACING
+    final_ys = [0.0] * len(label_positions)
+    for rank, (orig_i, _) in enumerate(indexed):
+        final_ys[orig_i] = adj_ys[rank]
+
+    for i, (label, color) in enumerate(zip(labels, colors)):
+        new_text = etree.SubElement(root, f"{{{SVG_NS}}}text")
+        new_text.set("x", f"{label_x:.4f}")
+        new_text.set("y", f"{final_ys[i]:.4f}")
+        new_text.set("style",
+            f"font-style:normal;font-weight:normal;font-size:{LABEL_FONT}px;"
+            f"font-family:Arial;text-anchor:end;text-align:end;fill:{color}")
+        new_text.text = label
+
+    return etree.tostring(root, encoding="unicode")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert a multi-curve LTspice EMF to SVG, colouring each curve "
+            "with a distinct GNOME High Color and adding inline labels."
+        )
+    )
+    parser.add_argument("input", help="Path to the input EMF file (extension optional).")
+    parser.add_argument("--xlabel", required=True, metavar="TEXT", help="X-axis label.")
+    parser.add_argument("--ylabel", required=True, metavar="TEXT", help="Y-axis label.")
+    parser.add_argument(
+        "--clabels", nargs="+", required=True, metavar="TEXT",
+        help="One label per curve, in LTspice draw order (same as .raw file / legend).",
+    )
+    parser.add_argument(
+        "--output", default=None, metavar="FILE",
+        help="Output .svg path (default: input stem + .svg).",
+    )
+
+    args = parser.parse_args()
+
+    # Shell-expansion warning
+    for name, val in ([("--xlabel", args.xlabel), ("--ylabel", args.ylabel)]
+                      + [(f"--clabels[{i}]", v) for i, v in enumerate(args.clabels)]):
+        if "\\" in val and "$" not in val:
+            print(
+                f"Warning: {name} value {val!r} contains backslash but does not "
+                "start with '$'.\n  Likely shell expansion — use single quotes.",
+                file=sys.stderr,
+            )
+
+    # Auto-append .emf if no extension given
+    if not os.path.splitext(args.input)[1]:
+        candidate = args.input + ".emf"
+        if os.path.exists(candidate):
+            args.input = candidate
+
+    if args.output is None:
+        base, _ = os.path.splitext(args.input)
+        args.output = base + ".svg"
+
+    if not os.path.exists(args.input):
+        print(f"Error: file not found: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    n_curves = len(args.clabels)
+    colors = [GNOME_HIGH_COLORS[i % len(GNOME_HIGH_COLORS)] for i in range(n_curves)]
+
+    _, ext = os.path.splitext(args.input)
+    if ext.lower() == ".svg":
+        tmp_svg_path = args.input
+        _cleanup_tmp = False
+    else:
+        tmp_svg_path = convert_emf_to_svg(args.input)
+        _cleanup_tmp = True
+
+    try:
+        svg_content = scale_svg(tmp_svg_path)
+        svg_content = normalize_text_transforms(svg_content)
+        svg_content = split_compound_curves(svg_content)
+        svg_content = recolor_curves(svg_content, colors)
+        svg_content = remove_legend(svg_content)
+        svg_content = fix_xaxis_labels(svg_content)
+        svg_content = fix_yaxis_labels(svg_content)
+        svg_content = add_xlabel(svg_content, args.xlabel)
+        svg_content = add_ylabel(svg_content, args.ylabel)
+        svg_content = add_curve_labels(svg_content, args.clabels, colors)
+
+        if args.xlabel:
+            svg_content = svg_content.replace("%%XLABEL%%", args.xlabel)
+        if args.ylabel:
+            svg_content = svg_content.replace("%%YLABEL%%", args.ylabel)
+
+        svg_content = crop_to_content(svg_content, margin_mm=2.0)
+
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(svg_content)
+        print(f"Done: {args.output}")
+    finally:
+        if _cleanup_tmp and os.path.exists(tmp_svg_path):
+            os.remove(tmp_svg_path)
+
+
+if __name__ == "__main__":
+    main()

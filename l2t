@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# l2t – LTspice → SVG → TikZ pipeline
+# Ruft ltspice2svg und s2t nacheinander auf.
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Verwendung: l2t [OPTIONEN] [input]
+
+Konvertiert eine LTspice-Datei über SVG nach TikZ/LaTeX.
+
+Argumente:
+  input                  Eingabedatei (Standard: *.emf im aktuellen Verzeichnis)
+
+Pflichtoptionen (ltspice2svg):
+  --xlabel TEXT          Beschriftung der X-Achse
+  --ylabel TEXT          Beschriftung der Y-Achse
+
+Optionale Optionen (ltspice2svg):
+  --color HEX            Linienfarbe als HEX-Wert (z.B. #ff0000)
+  --svg FILE             Name der Zwischen-SVG-Datei (Standard: <input>.svg)
+
+Optionale Optionen (s2t):
+  --output FILE          Ausgabedatei (Standard: <input>.tex)
+  --textwidth N          Zielbreite in mm (Standard: 150)
+
+Sonstige Optionen:
+  --keep-svg             SVG-Zwischendatei nicht löschen
+  --help                 Diese Hilfe anzeigen
+
+Alle weiteren Argumente werden an s2t weitergegeben.
+EOF
+    exit 0
+}
+
+# ---------- Defaults ----------
+INPUT=""
+XLABEL=""
+YLABEL=""
+COLOR=""
+SVG_FILE=""
+OUTPUT_FILE=""
+TEXTWIDTH=""
+KEEP_SVG=0
+EXTRA_S2T_ARGS=()
+
+# ---------- Argument-Parsing ----------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)     usage ;;
+        --xlabel)      XLABEL="$2";     shift 2 ;;
+        --ylabel)      YLABEL="$2";     shift 2 ;;
+        --color)       COLOR="$2";      shift 2 ;;
+        --svg)         SVG_FILE="$2";   shift 2 ;;
+        --output)      OUTPUT_FILE="$2"; shift 2 ;;
+        --textwidth)   TEXTWIDTH="$2";  shift 2 ;;
+        --keep-svg)    KEEP_SVG=1;      shift ;;
+        -*)            EXTRA_S2T_ARGS+=("$1"); shift ;;
+        *)
+            if [[ -z "$INPUT" ]]; then
+                INPUT="$1"
+            else
+                EXTRA_S2T_ARGS+=("$1")
+            fi
+            shift ;;
+    esac
+done
+
+# ---------- Input ermitteln ----------
+if [[ -z "$INPUT" ]]; then
+    # Automatisch nach .emf suchen
+    EMF_FILES=( *.emf )
+    if [[ ${#EMF_FILES[@]} -eq 0 ]]; then
+        echo "Fehler: Keine .emf-Datei gefunden und kein Input angegeben." >&2
+        exit 1
+    elif [[ ${#EMF_FILES[@]} -gt 1 ]]; then
+        echo "Fehler: Mehrere .emf-Dateien gefunden – bitte explizit angeben:" >&2
+        printf '  %s\n' "${EMF_FILES[@]}" >&2
+        exit 1
+    fi
+    INPUT="${EMF_FILES[0]}"
+fi
+
+BASENAME="${INPUT%.*}"
+
+[[ -z "$SVG_FILE"    ]] && SVG_FILE="${BASENAME}.svg"
+[[ -z "$OUTPUT_FILE" ]] && OUTPUT_FILE="${BASENAME}.tex"
+
+# ---------- Pflichtparameter prüfen ----------
+if [[ -z "$XLABEL" || -z "$YLABEL" ]]; then
+    echo "Fehler: --xlabel und --ylabel sind Pflichtangaben." >&2
+    exit 1
+fi
+
+# ---------- ltspice2svg aufrufen ----------
+L2S_CMD=(ltspice2svg --xlabel "$XLABEL" --ylabel "$YLABEL" --output "$SVG_FILE")
+[[ -n "$COLOR" ]] && L2S_CMD+=(--color "$COLOR")
+L2S_CMD+=("$INPUT")
+
+echo "→ ltspice2svg: ${L2S_CMD[*]}"
+"${L2S_CMD[@]}"
+
+# ---------- s2t aufrufen ----------
+S2T_CMD=(s2t "$SVG_FILE" --output "$OUTPUT_FILE")
+[[ -n "$TEXTWIDTH" ]] && S2T_CMD+=(--textwidth "$TEXTWIDTH")
+S2T_CMD+=("${EXTRA_S2T_ARGS[@]}")
+
+echo "→ s2t: ${S2T_CMD[*]}"
+"${S2T_CMD[@]}"
+
+# ---------- Aufräumen ----------
+if [[ $KEEP_SVG -eq 0 ]]; then
+    rm -f "$SVG_FILE"
+    echo "→ SVG-Zwischendatei entfernt: $SVG_FILE"
+fi
+
+echo "✓ Fertig: $OUTPUT_FILE"
